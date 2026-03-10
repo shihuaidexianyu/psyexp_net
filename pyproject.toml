@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psyexp-net"
+version = "0.1.0"
+description = "Experiment networking primitives for psychology and cognitive science workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "OpenAI Codex"}]
+keywords = ["psychology", "experiment", "networking", "asyncio", "zmq"]
+dependencies = []
+
+[project.optional-dependencies]
+zmq = ["pyzmq>=25"]
+discovery = ["zeroconf>=0.132"]
+yaml = ["PyYAML>=6.0"]
+
+[project.scripts]
+psyexp-net = "psyexp_net.cli.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["psyexp_net*"]
+
+[tool.unittest]
+start-directory = "tests"
+
