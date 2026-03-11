@@ -377,6 +377,82 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 await server.shutdown()
 
+    async def test_register_rejects_major_protocol_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server_config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "protocol": {"version": "2.0"},
+                }
+            )
+            client_config = AppConfig.from_mapping(
+                {
+                    "protocol": {"version": "1.0"},
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(server_config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                client_config,
+                role="stimulus",
+                client_id="stim-version",
+                transport=InMemoryClientTransport(hub, "stim-version"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                response = await client.register()
+
+                self.assertEqual(response.msg_type, "REGISTER_REJECT")
+                self.assertEqual(response.payload["error_code"], "VERSION_MISMATCH")
+                self.assertEqual(client.status, ClientStatus.REJECTED)
+                self.assertIsNone(server.registry.get("stim-version"))
+            finally:
+                await client.close()
+                await server.shutdown()
+
+    async def test_register_negotiates_minor_protocol_and_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server_config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "protocol": {"version": "1.2"},
+                }
+            )
+            client_config = AppConfig.from_mapping(
+                {
+                    "protocol": {"version": "1.0"},
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(server_config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                client_config,
+                role="stimulus",
+                client_id="stim-version",
+                transport=InMemoryClientTransport(hub, "stim-version"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                response = await client.register()
+
+                self.assertEqual(response.msg_type, "REGISTER_OK")
+                self.assertEqual(response.payload["protocol_version"], "1.0")
+                self.assertTrue(response.payload["degraded_protocol"])
+                self.assertIn("timing.sync", response.payload["capabilities"])
+                self.assertEqual(client.negotiated_protocol_version, "1.0")
+                self.assertIn("snapshot.sync", client.negotiated_capabilities)
+                self.assertEqual(
+                    server.registry.get("stim-version").protocol_version,
+                    "1.0",
+                )
+            finally:
+                await client.close()
+                await server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

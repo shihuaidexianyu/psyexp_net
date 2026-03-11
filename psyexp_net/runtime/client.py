@@ -50,6 +50,8 @@ class ExperimentClient:
         self.rtt_ms = 0.0
         self.session = SessionManager()
         self.registry_snapshot: list[dict[str, str | float]] = []
+        self.negotiated_protocol_version = config.protocol.version
+        self.negotiated_capabilities: list[str] = []
         self._handlers: dict[str, list[Handler]] = defaultdict(list)
         self._dedupe = MessageDeduplicator(config.protocol.dedup_cache_size)
         self._responses: dict[str, asyncio.Future[Message]] = {}
@@ -106,7 +108,7 @@ class ExperimentClient:
             "instance_uuid": self.identity.instance_uuid,
             "client_secret": self.identity.client_secret,
             "protocol_version": self.config.protocol.version,
-            "capabilities": ["timing.sync", "structured-logs"],
+            "capabilities": self._capabilities(),
         }
         response = await self._exchange(
             MessageType.REGISTER,
@@ -294,6 +296,18 @@ class ExperimentClient:
         registry = response.payload.get("registry")
         if isinstance(registry, list):
             self.registry_snapshot = list(registry)
+        negotiated_protocol_version = response.payload.get("protocol_version")
+        if isinstance(negotiated_protocol_version, str):
+            self.negotiated_protocol_version = negotiated_protocol_version
+        capabilities = response.payload.get("capabilities")
+        if isinstance(capabilities, list):
+            self.negotiated_capabilities = [str(item) for item in capabilities]
+
+    def _capabilities(self) -> list[str]:
+        capabilities = {"structured-logs", "snapshot.sync", "timing.sync"}
+        if self.identity.client_secret is not None:
+            capabilities.add("auth.shared-secret")
+        return sorted(capabilities)
 
     async def _heartbeat_loop(self) -> None:
         interval_s = max(self.config.network.heartbeat_interval_ms / 1000, 0.05)

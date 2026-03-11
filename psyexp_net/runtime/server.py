@@ -10,11 +10,17 @@ from typing import Any
 
 from psyexp_net.config import AppConfig
 from psyexp_net.enums import ClientStatus, ErrorCode, MessageType
-from psyexp_net.errors import AckTimeoutError, AuthenticationError, DuplicateClientError
+from psyexp_net.errors import (
+    AckTimeoutError,
+    AuthenticationError,
+    DuplicateClientError,
+    VersionMismatchError,
+)
 from psyexp_net.logging.metrics import MetricsCollector
 from psyexp_net.logging.recorder import EventRecorder
 from psyexp_net.protocol.ack import PendingAckManager
 from psyexp_net.protocol.message import Message, MessageHeader, make_ack
+from psyexp_net.protocol.versioning import negotiate_protocol
 from psyexp_net.runtime.barrier import BarrierManager
 from psyexp_net.runtime.registry import ClientInfo, ClientRegistry
 from psyexp_net.runtime.scheduler import resolve_execute_at
@@ -201,6 +207,12 @@ class ExperimentServer:
 
     async def _handle_register(self, peer_id: str, message: Message) -> None:
         try:
+            protocol = negotiate_protocol(
+                self.config.protocol.version,
+                message.payload.get("protocol_version", self.config.protocol.version),
+                server_capabilities=self._server_capabilities(),
+                client_capabilities=list(message.payload.get("capabilities", [])),
+            )
             self.authenticator.validate(
                 peer_id,
                 client_secret=message.payload.get("client_secret"),
@@ -208,10 +220,8 @@ class ExperimentServer:
             info = ClientInfo(
                 client_id=peer_id,
                 role=message.payload["role"],
-                protocol_version=message.payload.get(
-                    "protocol_version", self.config.protocol.version
-                ),
-                capabilities=message.payload.get("capabilities", []),
+                protocol_version=protocol.version,
+                capabilities=protocol.capabilities,
                 current_status=ClientStatus.REGISTERED,
             )
             registered, refreshed = self.registry.register_or_refresh(info)
@@ -223,6 +233,17 @@ class ExperimentServer:
                 "registry": self.registry.snapshot(),
                 "reconnected": refreshed,
                 "client_id": registered.client_id,
+                "protocol_version": protocol.version,
+                "capabilities": protocol.capabilities,
+                "degraded_protocol": protocol.degraded,
+            }
+        except VersionMismatchError as exc:
+            response_type = MessageType.REGISTER_REJECT
+            payload = {
+                "accepted": False,
+                "error_code": ErrorCode.VERSION_MISMATCH.value,
+                "server_protocol_version": self.config.protocol.version,
+                "reason": str(exc),
             }
         except AuthenticationError:
             response_type = MessageType.REGISTER_REJECT
@@ -239,6 +260,13 @@ class ExperimentServer:
         response = self._message(response_type, payload, reply_to=message.header.msg_id)
         await self.transport.send(peer_id, response)
         self._record("register_response", peer_id, response, payload=payload)
+
+    def _server_capabilities(self) -> list[str]:
+        capabilities = {"structured-logs", "snapshot.sync"}
+        if self.config.security.require_secret:
+            capabilities.add("auth.shared-secret")
+        capabilities.add("timing.sync")
+        return sorted(capabilities)
 
     async def _handle_ping(self, peer_id: str, message: Message) -> None:
         payload = {
