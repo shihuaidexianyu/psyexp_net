@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -126,8 +127,18 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             summary = replay.summary()
             self.assertGreater(summary["event_count"], 0)
             self.assertIn("send", summary["kinds"])
+            self.assertIn("send", summary["kind_counts"])
             self.assertIn("T001", summary["trial_ids"])
             self.assertGreaterEqual(summary["acked_messages"], 1)
+            self.assertIn("messages_sent", summary["metrics"])
+            self.assertIn("result_reports", summary["metrics"])
+            self.assertIn("ack_latency_ms_mean", summary["metrics"])
+            self.assertIn("sent", summary["transport_metrics"])
+            persisted_summary = json.loads(
+                (session_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted_summary["event_count"], summary["event_count"])
+            self.assertIn("metrics", persisted_summary)
 
             trial_timeline = replay.trial_timeline("T001")
             self.assertTrue(

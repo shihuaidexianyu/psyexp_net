@@ -47,6 +47,16 @@ class PendingAckManager:
             entry.future.set_result(value)
         return True
 
+    def resolve_entry(
+        self, reply_to: str, peer_id: str, value: object | None = None
+    ) -> PendingAck | None:
+        entry = self.pending.pop((reply_to, peer_id), None)
+        if entry is None:
+            return None
+        if entry.future is not None and not entry.future.done():
+            entry.future.set_result(value)
+        return entry
+
     def expire(self) -> list[PendingAck]:
         """提取所有已超时的 ACK 条目。"""
         now = time.monotonic()

@@ -11,6 +11,7 @@ class ReplayEngine:
     def __init__(self, session_dir: str | Path) -> None:
         self.session_dir = Path(session_dir)
         self.log_path = self.session_dir / "events.jsonl"
+        self.summary_path = self.session_dir / "summary.json"
 
     def events(self) -> list[dict[str, Any]]:
         if not self.log_path.exists():
@@ -19,6 +20,10 @@ class ReplayEngine:
             return [json.loads(line) for line in handle if line.strip()]
 
     def summary(self) -> dict[str, Any]:
+        if self.summary_path.exists():
+            persisted = json.loads(self.summary_path.read_text(encoding="utf-8"))
+        else:
+            persisted = {}
         events = self.events()
         trial_ids = sorted(
             {
@@ -34,12 +39,23 @@ class ReplayEngine:
             if event.get("kind") == "send"
             and self.message_timeline(self._message_id(event)).get("acks")
         )
+        persisted_kinds = persisted.get("kinds", {})
+        if isinstance(persisted_kinds, dict):
+            kind_counts = persisted_kinds
+            kinds = sorted(persisted_kinds)
+        else:
+            kind_counts = {}
+            kinds = persisted_kinds or sorted({event["kind"] for event in events})
         return {
             "session_dir": str(self.session_dir),
-            "event_count": len(events),
-            "kinds": sorted({event["kind"] for event in events}),
-            "trial_ids": trial_ids,
+            "event_count": persisted.get("event_count", len(events)),
+            "kinds": kinds,
+            "kind_counts": kind_counts,
+            "trial_ids": persisted.get("trial_ids", trial_ids),
             "acked_messages": acked_messages,
+            "metrics": persisted.get("metrics", {}),
+            "transport_metrics": persisted.get("transport_metrics", {}),
+            "registry": persisted.get("registry", []),
         }
 
     def trial_timeline(self, trial_id: str) -> list[dict[str, Any]]:

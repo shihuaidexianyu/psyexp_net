@@ -66,7 +66,12 @@ class ExperimentServer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._serve_task
         await self.transport.stop()
-        self.recorder.close()
+        self.recorder.close(
+            metrics=self.metrics.snapshot(),
+            transport_metrics=self.transport.get_metrics(),
+            registry=self.registry.snapshot(),
+            session=asdict(self.session.snapshot()),
+        )
 
     async def wait_until_clients_ready(
         self, required_roles: list[str] | None = None, timeout: float = 5.0
@@ -156,14 +161,19 @@ class ExperimentServer:
             status = message.payload.get("status", ClientStatus.CONNECTED)
             self.registry.update_status(peer_id, status)
             if "offset_ms" in message.payload or "rtt_ms" in message.payload:
+                offset_ms = float(message.payload.get("offset_ms", 0.0))
+                rtt_ms = float(message.payload.get("rtt_ms", 0.0))
                 self.registry.update_sync(
                     peer_id,
-                    offset_ms=float(message.payload.get("offset_ms", 0.0)),
-                    rtt_ms=float(message.payload.get("rtt_ms", 0.0)),
+                    offset_ms=offset_ms,
+                    rtt_ms=rtt_ms,
                 )
+                self.metrics.observe("client_offset_ms", offset_ms)
+                self.metrics.observe("client_rtt_ms", rtt_ms)
             return
         if msg_type == MessageType.RESULT_REPORT:
             role = message.header.sender_role
+            self.metrics.increment("result_reports")
             await self._results[role].put(message.payload)
             return
         if msg_type == MessageType.EVENT_REPORT:
@@ -171,9 +181,14 @@ class ExperimentServer:
             return
         if msg_type == MessageType.ACK:
             receiver_id = message.payload.get("receiver_id", peer_id)
-            self.pending_acks.resolve(
+            entry = self.pending_acks.resolve_entry(
                 message.payload["reply_to"], receiver_id, message.payload
             )
+            if entry is not None:
+                self.metrics.observe(
+                    "ack_latency_ms",
+                    (time.monotonic() - entry.created_at) * 1000,
+                )
             return
         if msg_type == MessageType.HEARTBEAT:
             self.registry.update_status(
@@ -276,6 +291,7 @@ class ExperimentServer:
             future = asyncio.get_running_loop().create_future()
             self.pending_acks.add(message.header.msg_id, peer_id, future)
         await self.transport.send(peer_id, message)
+        self.metrics.increment("messages_sent")
         self._record("send", peer_id, message, payload=payload)
         if future is not None:
             try:
