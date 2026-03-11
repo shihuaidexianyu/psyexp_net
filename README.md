@@ -71,6 +71,8 @@ python3 -m psyexp_net benchmark --backend zmq --clients 4 --seconds 2
 python3 -m psyexp_net replay .psyexp_net/sessions/<session-dir>
 ```
 
+`ReplayEngine` 现在还支持按 `trial_id` 查看事件时间线，以及按 `msg_id` 查看关键控制消息的 `send -> ACK` 轨迹，便于排查控制命令是否按时送达和执行。
+
 ## MVP 范围
 
 已实现：

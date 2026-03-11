@@ -122,9 +122,31 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await response.close()
             await server.shutdown()
 
-            summary = ReplayEngine(session_dir).summary()
+            replay = ReplayEngine(session_dir)
+            summary = replay.summary()
             self.assertGreater(summary["event_count"], 0)
             self.assertIn("send", summary["kinds"])
+            self.assertIn("T001", summary["trial_ids"])
+            self.assertGreaterEqual(summary["acked_messages"], 1)
+
+            trial_timeline = replay.trial_timeline("T001")
+            self.assertTrue(
+                any(item["msg_type"] == "TRIAL_START_AT" for item in trial_timeline)
+            )
+            send_event = next(
+                event
+                for event in replay.events()
+                if event["kind"] == "send"
+                and event["message"]["header"]["msg_type"] == "TRIAL_START_AT"
+                and event["message"]["header"]["trial_id"] == "T001"
+            )
+            timeline = replay.message_timeline(send_event["message"]["header"]["msg_id"])
+            self.assertEqual(timeline["msg_type"], "TRIAL_START_AT")
+            self.assertEqual(timeline["trial_id"], "T001")
+            self.assertGreaterEqual(len(timeline["acks"]), 1)
+            self.assertTrue(
+                all(ack["status"] == "ok" for ack in timeline["acks"])
+            )
 
     async def test_server_marks_client_disconnected_after_heartbeat_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

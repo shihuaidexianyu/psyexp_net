@@ -115,9 +115,22 @@ def main() -> None:
             for line in args.path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        trial_ids = sorted(
+            {
+                item.get("message", {}).get("header", {}).get("trial_id")
+                or item.get("session", {}).get("trial_id")
+                for item in data
+                if item.get("message") or item.get("session")
+            }
+            - {None}
+        )
         print(
             json.dumps(
-                {"rows": len(data), "kinds": sorted({item["kind"] for item in data})},
+                {
+                    "rows": len(data),
+                    "kinds": sorted({item["kind"] for item in data}),
+                    "trial_ids": trial_ids,
+                },
                 indent=2,
                 ensure_ascii=False,
             )
