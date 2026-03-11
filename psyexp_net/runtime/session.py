@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import Any
 
 from psyexp_net.enums import SessionState
 
@@ -75,3 +76,16 @@ class SessionManager:
             phase=self.current_phase,
             parameter_version=self.parameter_version,
         )
+
+    def apply_snapshot(self, snapshot: SessionSnapshot | dict[str, Any]) -> SessionSnapshot:
+        if isinstance(snapshot, dict):
+            snapshot = SessionSnapshot(**snapshot)
+        self.session_id = snapshot.session_id
+        self.state = snapshot.state
+        self.current_trial_id = snapshot.trial_id
+        self.current_phase = snapshot.phase
+        self.parameter_version = snapshot.parameter_version
+        return self.snapshot()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self.snapshot())

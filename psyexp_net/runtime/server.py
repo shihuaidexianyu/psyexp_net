@@ -193,13 +193,15 @@ class ExperimentServer:
                 capabilities=message.payload.get("capabilities", []),
                 current_status=ClientStatus.REGISTERED,
             )
-            self.registry.register(info)
+            registered, refreshed = self.registry.register_or_refresh(info)
             response_type = MessageType.REGISTER_OK
             payload = {
                 "accepted": True,
                 # 注册成功时带回当前会话快照，便于迟到或重连客户端追平状态。
                 "snapshot": asdict(self.session.snapshot()),
                 "registry": self.registry.snapshot(),
+                "reconnected": refreshed,
+                "client_id": registered.client_id,
             }
         except DuplicateClientError:
             response_type = MessageType.REGISTER_REJECT

@@ -43,6 +43,19 @@ class ClientRegistry:
         self._clients[info.client_id] = info
         return info
 
+    def register_or_refresh(self, info: ClientInfo) -> tuple[ClientInfo, bool]:
+        existing = self._clients.get(info.client_id)
+        if existing is None or existing.current_status == ClientStatus.DISCONNECTED:
+            self._clients[info.client_id] = info
+            return info, False
+        if existing.role != info.role:
+            raise DuplicateClientError(f"Duplicate client id: {info.client_id}")
+        existing.protocol_version = info.protocol_version
+        existing.capabilities = info.capabilities
+        existing.current_status = ClientStatus.REGISTERED
+        existing.touch()
+        return existing, True
+
     def update_status(self, client_id: str, status: str) -> None:
         if client_id not in self._clients:
             return

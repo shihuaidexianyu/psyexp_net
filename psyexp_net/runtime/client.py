@@ -10,6 +10,7 @@ from psyexp_net.config import AppConfig
 from psyexp_net.enums import ClientStatus, MessageType
 from psyexp_net.protocol.ack import MessageDeduplicator
 from psyexp_net.protocol.message import Message, MessageHeader, make_ack
+from psyexp_net.runtime.session import SessionManager
 from psyexp_net.timing.sync import SyncEstimator
 from psyexp_net.transport.base import TransportBackend
 
@@ -37,6 +38,8 @@ class ExperimentClient:
         self.status = ClientStatus.DISCOVERED
         self.offset_ms = 0.0
         self.rtt_ms = 0.0
+        self.session = SessionManager()
+        self.registry_snapshot: list[dict[str, str | float]] = []
         self._handlers: dict[str, list[Handler]] = defaultdict(list)
         self._dedupe = MessageDeduplicator(config.protocol.dedup_cache_size)
         self._responses: dict[str, asyncio.Future[Message]] = {}
@@ -103,6 +106,8 @@ class ExperimentClient:
             if response.msg_type == MessageType.REGISTER_OK.value
             else ClientStatus.REJECTED
         )
+        if response.msg_type == MessageType.REGISTER_OK.value:
+            self._apply_register_snapshot(response)
         return response
 
     async def sync_clock(self, *, preserve_status: bool = False) -> tuple[float, float]:
@@ -150,6 +155,7 @@ class ExperimentClient:
                 pass
             await self.transport.start()
             self.status = ClientStatus.CONNECTED
+            await self.register()
             await self.sync_clock(preserve_status=True)
             await self.ready()
 
@@ -268,6 +274,14 @@ class ExperimentClient:
 
     def _local_monotonic_for_server(self, server_time: float) -> float:
         return server_time - self.offset_ms / 1000
+
+    def _apply_register_snapshot(self, response: Message) -> None:
+        snapshot = response.payload.get("snapshot")
+        if isinstance(snapshot, dict):
+            self.session.apply_snapshot(snapshot)
+        registry = response.payload.get("registry")
+        if isinstance(registry, list):
+            self.registry_snapshot = list(registry)
 
     async def _heartbeat_loop(self) -> None:
         interval_s = max(self.config.network.heartbeat_interval_ms / 1000, 0.05)

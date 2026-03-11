@@ -204,6 +204,73 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 await server.shutdown()
 
+    async def test_late_client_receives_session_snapshot_on_register(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                config,
+                role="stimulus",
+                client_id="stim-late",
+                transport=InMemoryClientTransport(hub, "stim-late"),
+            )
+
+            await server.start()
+            try:
+                await server.start_session("S-LATE")
+                await server.arm_trial("T-LATE")
+                await server.start_trial("T-LATE", at="+20ms")
+
+                await client.connect()
+                response = await client.register()
+
+                self.assertEqual(response.msg_type, "REGISTER_OK")
+                self.assertEqual(client.session.session_id, "S-LATE")
+                self.assertEqual(client.session.state, "RUNNING")
+                self.assertEqual(client.session.current_trial_id, "T-LATE")
+                self.assertEqual(client.session.current_phase, "running")
+                self.assertTrue(client.registry_snapshot)
+            finally:
+                await client.close()
+                await server.shutdown()
+
+    async def test_reregister_same_client_refreshes_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                config,
+                role="stimulus",
+                client_id="stim-refresh",
+                transport=InMemoryClientTransport(hub, "stim-refresh"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                first = await client.register()
+                await server.start_session("S-REFRESH")
+                second = await client.register()
+
+                self.assertEqual(first.msg_type, "REGISTER_OK")
+                self.assertEqual(second.msg_type, "REGISTER_OK")
+                self.assertTrue(second.payload["reconnected"])
+                self.assertEqual(client.session.session_id, "S-REFRESH")
+                self.assertEqual(client.session.state, "RUNNING")
+            finally:
+                await client.close()
+                await server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
