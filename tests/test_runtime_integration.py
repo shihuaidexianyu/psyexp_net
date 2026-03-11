@@ -133,6 +133,10 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("messages_sent", summary["metrics"])
             self.assertIn("result_reports", summary["metrics"])
             self.assertIn("ack_latency_ms_mean", summary["metrics"])
+            self.assertIn("ack_latency_ms_p95", summary["metrics"])
+            self.assertIn("command_receive_delay_ms_mean", summary["metrics"])
+            self.assertIn("command_apply_delay_ms_mean", summary["metrics"])
+            self.assertIn("apply_skew_ms_mean", summary["metrics"])
             self.assertIn("sent", summary["transport_metrics"])
             persisted_summary = json.loads(
                 (session_dir / "summary.json").read_text(encoding="utf-8")

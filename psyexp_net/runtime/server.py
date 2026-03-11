@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -56,6 +57,8 @@ class ExperimentServer:
         self._results: dict[str, asyncio.Queue[dict[str, Any]]] = defaultdict(
             asyncio.Queue
         )
+        self._message_tracking: dict[str, dict[str, Any]] = {}
+        self._command_groups: dict[str, dict[str, Any]] = {}
         self._serve_task: asyncio.Task[None] | None = None
         self._running = False
 
@@ -195,6 +198,7 @@ class ExperimentServer:
                     "ack_latency_ms",
                     (time.monotonic() - entry.created_at) * 1000,
                 )
+                self._observe_ack_timing(entry.msg_id, receiver_id, message.payload)
             return
         if msg_type == MessageType.HEARTBEAT:
             self.registry.update_status(
@@ -288,11 +292,19 @@ class ExperimentServer:
         trial_id: str | None = None,
     ) -> None:
         # 每个 client 的 ACK 独立跟踪，因此这里做 fan-out 发送。
+        command_id = uuid.uuid4().hex if requires_ack else None
+        if command_id is not None:
+            self._command_groups[command_id] = {
+                "msg_type": msg_type.value if isinstance(msg_type, MessageType) else str(msg_type),
+                "trial_id": trial_id,
+                "expected_peers": [client.client_id for client in self.registry.all()],
+                "apply_times": {},
+            }
         tasks = [
             self._send_control(
                 client.client_id,
                 msg_type,
-                payload,
+                {**payload, **({"command_id": command_id} if command_id is not None else {})},
                 requires_ack=requires_ack,
                 trial_id=trial_id,
             )
@@ -318,6 +330,15 @@ class ExperimentServer:
             # 关键消息发送前先登记 pending 表。
             future = asyncio.get_running_loop().create_future()
             self.pending_acks.add(message.header.msg_id, peer_id, future)
+            command_id = payload.get("command_id")
+            if isinstance(command_id, str):
+                self._message_tracking[message.header.msg_id] = {
+                    "command_id": command_id,
+                    "server_ts": message.header.server_ts,
+                    "peer_id": peer_id,
+                    "trial_id": trial_id,
+                    "msg_type": message.msg_type,
+                }
         await self.transport.send(peer_id, message)
         self.metrics.increment("messages_sent")
         self._record("send", peer_id, message, payload=payload)
@@ -380,6 +401,34 @@ class ExperimentServer:
                     None,
                     payload={"status": ClientStatus.DEGRADED, "last_seen_age_s": age},
                 )
+
+    def _observe_ack_timing(
+        self, msg_id: str, receiver_id: str, payload: dict[str, Any]
+    ) -> None:
+        tracking = self._message_tracking.pop(msg_id, None)
+        if tracking is None:
+            return
+        client = self.registry.get(receiver_id)
+        offset_s = client.offset_estimate_ms / 1000 if client is not None else 0.0
+        server_ts = tracking.get("server_ts")
+        receive_ts = payload.get("receive_ts")
+        apply_ts = payload.get("apply_ts")
+        if isinstance(server_ts, (int, float)) and isinstance(receive_ts, (int, float)):
+            receive_delay_ms = ((float(receive_ts) + offset_s) - float(server_ts)) * 1000
+            self.metrics.observe("command_receive_delay_ms", max(0.0, receive_delay_ms))
+        if isinstance(server_ts, (int, float)) and isinstance(apply_ts, (int, float)):
+            apply_delay_ms = ((float(apply_ts) + offset_s) - float(server_ts)) * 1000
+            self.metrics.observe("command_apply_delay_ms", max(0.0, apply_delay_ms))
+            command_id = tracking.get("command_id")
+            if isinstance(command_id, str) and command_id in self._command_groups:
+                group = self._command_groups[command_id]
+                group["apply_times"][receiver_id] = float(apply_ts) + offset_s
+                apply_times = list(group["apply_times"].values())
+                if len(apply_times) >= 2:
+                    skew_ms = (max(apply_times) - min(apply_times)) * 1000
+                    self.metrics.observe("apply_skew_ms", skew_ms)
+                if len(group["apply_times"]) >= len(group["expected_peers"]):
+                    self._command_groups.pop(command_id, None)
 
     def _message(
         self,
