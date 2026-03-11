@@ -10,7 +10,7 @@ from typing import Any
 
 from psyexp_net.config import AppConfig
 from psyexp_net.enums import ClientStatus, ErrorCode, MessageType
-from psyexp_net.errors import AckTimeoutError, DuplicateClientError
+from psyexp_net.errors import AckTimeoutError, AuthenticationError, DuplicateClientError
 from psyexp_net.logging.metrics import MetricsCollector
 from psyexp_net.logging.recorder import EventRecorder
 from psyexp_net.protocol.ack import PendingAckManager
@@ -19,6 +19,7 @@ from psyexp_net.runtime.barrier import BarrierManager
 from psyexp_net.runtime.registry import ClientInfo, ClientRegistry
 from psyexp_net.runtime.scheduler import resolve_execute_at
 from psyexp_net.runtime.session import SessionManager
+from psyexp_net.security.auth import TrustedLanAuthenticator
 from psyexp_net.transport.base import TransportBackend
 
 """服务端运行时。
@@ -41,6 +42,7 @@ class ExperimentServer:
         self.barrier = BarrierManager(self.registry)
         self.session = SessionManager()
         self.metrics = MetricsCollector()
+        self.authenticator = TrustedLanAuthenticator(config.security)
         self.recorder = recorder or EventRecorder(
             base_dir=Path(config.logging.base_dir)
         )
@@ -184,6 +186,10 @@ class ExperimentServer:
 
     async def _handle_register(self, peer_id: str, message: Message) -> None:
         try:
+            self.authenticator.validate(
+                peer_id,
+                client_secret=message.payload.get("client_secret"),
+            )
             info = ClientInfo(
                 client_id=peer_id,
                 role=message.payload["role"],
@@ -202,6 +208,12 @@ class ExperimentServer:
                 "registry": self.registry.snapshot(),
                 "reconnected": refreshed,
                 "client_id": registered.client_id,
+            }
+        except AuthenticationError:
+            response_type = MessageType.REGISTER_REJECT
+            payload = {
+                "accepted": False,
+                "error_code": ErrorCode.AUTH_FAILED.value,
             }
         except DuplicateClientError:
             response_type = MessageType.REGISTER_REJECT

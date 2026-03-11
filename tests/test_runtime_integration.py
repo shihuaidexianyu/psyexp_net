@@ -271,6 +271,79 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
                 await server.shutdown()
 
+    async def test_register_requires_shared_secret_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "security": {
+                        "require_secret": True,
+                        "shared_secrets": {"stim-auth": "secret-123"},
+                    },
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                config,
+                role="stimulus",
+                client_id="stim-auth",
+                transport=InMemoryClientTransport(hub, "stim-auth"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                response = await client.register()
+
+                self.assertEqual(response.msg_type, "REGISTER_OK")
+                self.assertEqual(client.status, ClientStatus.REGISTERED)
+                self.assertIsNotNone(server.registry.get("stim-auth"))
+            finally:
+                await client.close()
+                await server.shutdown()
+
+    async def test_register_rejects_invalid_shared_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server_config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "security": {
+                        "require_secret": True,
+                        "shared_secrets": {"stim-auth": "secret-123"},
+                    },
+                }
+            )
+            client_config = AppConfig.from_mapping(
+                {
+                    "security": {
+                        "require_secret": True,
+                        "shared_secrets": {"stim-auth": "wrong-secret"},
+                    },
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(server_config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                client_config,
+                role="stimulus",
+                client_id="stim-auth",
+                transport=InMemoryClientTransport(hub, "stim-auth"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                response = await client.register()
+
+                self.assertEqual(response.msg_type, "REGISTER_REJECT")
+                self.assertEqual(response.payload["error_code"], "AUTH_FAILED")
+                self.assertEqual(client.status, ClientStatus.REJECTED)
+                self.assertIsNone(server.registry.get("stim-auth"))
+            finally:
+                await client.close()
+                await server.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

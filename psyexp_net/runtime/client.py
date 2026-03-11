@@ -11,6 +11,7 @@ from psyexp_net.enums import ClientStatus, MessageType
 from psyexp_net.protocol.ack import MessageDeduplicator
 from psyexp_net.protocol.message import Message, MessageHeader, make_ack
 from psyexp_net.runtime.session import SessionManager
+from psyexp_net.security.identity import ClientIdentity
 from psyexp_net.timing.sync import SyncEstimator
 from psyexp_net.transport.base import TransportBackend
 
@@ -30,11 +31,20 @@ class ExperimentClient:
         role: str,
         client_id: str,
         transport: TransportBackend,
+        client_secret: str | None = None,
     ) -> None:
         self.config = config
         self.role = role
         self.client_id = client_id
         self.transport = transport
+        resolved_secret = client_secret
+        if resolved_secret is None:
+            resolved_secret = config.security.shared_secrets.get(client_id)
+        self.identity = ClientIdentity(
+            client_id=client_id,
+            role=role,
+            client_secret=resolved_secret,
+        )
         self.status = ClientStatus.DISCOVERED
         self.offset_ms = 0.0
         self.rtt_ms = 0.0
@@ -93,6 +103,8 @@ class ExperimentClient:
         payload = {
             "client_id": self.client_id,
             "role": self.role,
+            "instance_uuid": self.identity.instance_uuid,
+            "client_secret": self.identity.client_secret,
             "protocol_version": self.config.protocol.version,
             "capabilities": ["timing.sync", "structured-logs"],
         }

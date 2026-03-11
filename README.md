@@ -90,6 +90,8 @@ python3 -m psyexp_net replay .psyexp_net/sessions/<session-dir>
 * LSL bridge
 * 更严格的认证模式
 
+共享密钥认证当前已支持最小 Trusted LAN 校验。配置 `security.require_secret=true` 后，客户端会在注册阶段自动发送 `security.shared_secrets[client_id]` 对应的密钥，服务端不匹配时会返回 `AUTH_FAILED`。
+
 ## API 示例
 
 ```python
