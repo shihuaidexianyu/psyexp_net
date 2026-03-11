@@ -41,23 +41,35 @@ class ExperimentClient:
         self._dedupe = MessageDeduplicator(config.protocol.dedup_cache_size)
         self._responses: dict[str, asyncio.Future[Message]] = {}
         self._loop_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
         self._running = False
+        self._closing = False
+        self._reconnect_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         await self.transport.start()
         self.status = ClientStatus.CONNECTED
         self._running = True
+        self._closing = False
         # 接收循环后台运行，避免上层忘记主动拉消息。
         self._loop_task = asyncio.create_task(
             self._recv_loop(), name=f"psyexp-client:{self.client_id}"
         )
+        self._heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(), name=f"psyexp-heartbeat:{self.client_id}"
+        )
 
     async def close(self) -> None:
+        self._closing = True
         self._running = False
         if self._loop_task is not None:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._heartbeat_task
         await self.transport.stop()
         self.status = ClientStatus.DISCONNECTED
 
@@ -93,8 +105,9 @@ class ExperimentClient:
         )
         return response
 
-    async def sync_clock(self) -> tuple[float, float]:
+    async def sync_clock(self, *, preserve_status: bool = False) -> tuple[float, float]:
         # 使用四时间戳法估计 RTT 和时钟偏移。
+        previous_status = self.status
         estimator = SyncEstimator()
         t0 = time.monotonic()
         response = await self._exchange(
@@ -106,8 +119,10 @@ class ExperimentClient:
         )
         self.offset_ms = sample.offset_ms
         self.rtt_ms = sample.rtt_ms
-        self.status = ClientStatus.SYNCED
-        await self._send_status(ClientStatus.SYNCED)
+        self.status = previous_status if preserve_status else ClientStatus.SYNCED
+        await self._send_status(
+            previous_status if preserve_status else ClientStatus.SYNCED
+        )
         return self.offset_ms, self.rtt_ms
 
     async def ready(self) -> None:
@@ -124,9 +139,28 @@ class ExperimentClient:
     async def report_event(self, payload: dict[str, Any]) -> None:
         await self._send(MessageType.EVENT_REPORT, payload)
 
+    async def reconnect(self) -> None:
+        async with self._reconnect_lock:
+            if self._closing:
+                return
+            self.status = ClientStatus.RECONNECTING
+            try:
+                await self.transport.stop()
+            except Exception:
+                pass
+            await self.transport.start()
+            self.status = ClientStatus.CONNECTED
+            await self.sync_clock(preserve_status=True)
+            await self.ready()
+
     async def _recv_loop(self) -> None:
         while self._running:
-            event = await self.transport.recv(timeout=0.05)
+            try:
+                event = await self.transport.recv(timeout=0.05)
+            except Exception:
+                if self._running and not self._closing:
+                    await self.reconnect()
+                continue
             if event is None:
                 continue
             message = event.message
@@ -234,3 +268,33 @@ class ExperimentClient:
 
     def _local_monotonic_for_server(self, server_time: float) -> float:
         return server_time - self.offset_ms / 1000
+
+    async def _heartbeat_loop(self) -> None:
+        interval_s = max(self.config.network.heartbeat_interval_ms / 1000, 0.05)
+        sync_every = max(1, int(self.config.network.heartbeat_timeout_ms / max(self.config.network.heartbeat_interval_ms, 1)))
+        ticks = 0
+        while self._running:
+            await asyncio.sleep(interval_s)
+            if not self._running:
+                break
+            try:
+                await self._send(
+                    MessageType.HEARTBEAT,
+                    {
+                        "status": self.status,
+                        "offset_ms": self.offset_ms,
+                        "rtt_ms": self.rtt_ms,
+                    },
+                )
+                ticks += 1
+                if ticks % sync_every == 0:
+                    await self.sync_clock(preserve_status=True)
+                    if (
+                        abs(self.offset_ms) > self.config.timing.max_clock_offset_ms
+                        or self.rtt_ms > self.config.timing.max_rtt_ms
+                    ):
+                        self.status = ClientStatus.DEGRADED
+                        await self._send_status(ClientStatus.DEGRADED)
+            except Exception:
+                if self._running and not self._closing:
+                    await self.reconnect()

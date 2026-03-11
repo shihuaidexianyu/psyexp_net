@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
 from psyexp_net.config import AppConfig
+from psyexp_net.enums import ClientStatus
 from psyexp_net.logging.replay import ReplayEngine
+from psyexp_net.protocol.message import Message
 from psyexp_net.runtime.client import ExperimentClient
 from psyexp_net.runtime.server import ExperimentServer
+from psyexp_net.transport.base import ReceivedMessage, TransportBackend
 from psyexp_net.transport.memory import (
     InMemoryClientTransport,
     InMemoryHub,
@@ -15,6 +19,43 @@ from psyexp_net.transport.memory import (
 )
 
 """运行时端到端集成测试。"""
+
+
+class FlakyHeartbeatTransport(TransportBackend):
+    def __init__(self, inner: InMemoryClientTransport) -> None:
+        self.inner = inner
+        self.start_count = 0
+        self._armed = False
+        self._failed = False
+
+    def arm_heartbeat_failure(self) -> None:
+        self._armed = True
+
+    async def start(self) -> None:
+        self.start_count += 1
+        await self.inner.start()
+
+    async def stop(self) -> None:
+        await self.inner.stop()
+
+    async def send(self, peer_id: str, message: Message) -> None:
+        if (
+            self._armed
+            and not self._failed
+            and message.msg_type == "HEARTBEAT"
+        ):
+            self._failed = True
+            raise RuntimeError("simulated heartbeat failure")
+        await self.inner.send(peer_id, message)
+
+    async def broadcast(self, message: Message) -> None:
+        await self.inner.broadcast(message)
+
+    async def recv(self, timeout: float | None = None) -> ReceivedMessage | None:
+        return await self.inner.recv(timeout=timeout)
+
+    def get_metrics(self) -> dict[str, int]:
+        return self.inner.get_metrics()
 
 
 class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -84,6 +125,84 @@ class RuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             summary = ReplayEngine(session_dir).summary()
             self.assertGreater(summary["event_count"], 0)
             self.assertIn("send", summary["kinds"])
+
+    async def test_server_marks_client_disconnected_after_heartbeat_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "network": {
+                        "heartbeat_interval_ms": 20,
+                        "heartbeat_timeout_ms": 80,
+                    },
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(config, InMemoryServerTransport(hub))
+            client = ExperimentClient(
+                config,
+                role="stimulus",
+                client_id="stim-timeout",
+                transport=InMemoryClientTransport(hub, "stim-timeout"),
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                await client.register()
+                await client.sync_clock()
+                await client.ready()
+                await client.close()
+                await asyncio.sleep(0.2)
+
+                self.assertEqual(
+                    server.registry.get("stim-timeout").current_status,
+                    ClientStatus.DISCONNECTED,
+                )
+            finally:
+                await server.shutdown()
+
+    async def test_client_reconnects_after_heartbeat_send_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = AppConfig.from_mapping(
+                {
+                    "logging": {"base_dir": tmpdir},
+                    "network": {
+                        "heartbeat_interval_ms": 20,
+                        "heartbeat_timeout_ms": 120,
+                    },
+                }
+            )
+            hub = InMemoryHub()
+            server = ExperimentServer(config, InMemoryServerTransport(hub))
+            transport = FlakyHeartbeatTransport(
+                InMemoryClientTransport(hub, "stim-reconnect")
+            )
+            client = ExperimentClient(
+                config,
+                role="stimulus",
+                client_id="stim-reconnect",
+                transport=transport,
+            )
+
+            await server.start()
+            try:
+                await client.connect()
+                await client.register()
+                await client.sync_clock()
+                await client.ready()
+                transport.arm_heartbeat_failure()
+                await asyncio.sleep(0.2)
+
+                self.assertGreaterEqual(transport.start_count, 2)
+                self.assertEqual(client.status, ClientStatus.READY)
+                self.assertEqual(
+                    server.registry.get("stim-reconnect").current_status,
+                    ClientStatus.READY,
+                )
+            finally:
+                await client.close()
+                await server.shutdown()
 
 
 if __name__ == "__main__":

@@ -57,6 +57,11 @@ class ClientRegistry:
         info.rtt_ms = rtt_ms
         info.touch()
 
+    def touch(self, client_id: str) -> None:
+        if client_id not in self._clients:
+            return
+        self._clients[client_id].touch()
+
     def get(self, client_id: str) -> ClientInfo | None:
         return self._clients.get(client_id)
 
@@ -89,4 +94,12 @@ class ClientRegistry:
                 "rtt_ms": client.rtt_ms,
             }
             for client in self._clients.values()
+        ]
+
+    def stale_clients(self, timeout_s: float) -> list[ClientInfo]:
+        now = time.monotonic()
+        return [
+            client
+            for client in self._clients.values()
+            if now - client.last_seen >= timeout_s
         ]

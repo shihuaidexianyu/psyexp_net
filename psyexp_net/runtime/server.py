@@ -133,14 +133,17 @@ class ExperimentServer:
             if event is None:
                 # 空闲时也要处理 ACK 超时扫描。
                 self._expire_acks()
+                self._refresh_client_health()
                 continue
             self._record("receive", event.peer_id, event.message, channel=event.channel)
             await self._handle_message(event.peer_id, event.message)
             self._expire_acks()
+            self._refresh_client_health()
 
     async def _handle_message(self, peer_id: str, message: Message) -> None:
         # MVP 先集中分发，后续可按消息类型拆分为独立 handler。
         msg_type = message.msg_type
+        self.registry.touch(peer_id)
         if msg_type == MessageType.REGISTER:
             await self._handle_register(peer_id, message)
             return
@@ -285,6 +288,40 @@ class ExperimentServer:
                     "retries": entry.retries,
                 },
             )
+
+    def _refresh_client_health(self) -> None:
+        timeout_s = self.config.network.heartbeat_timeout_ms / 1000
+        degraded_s = timeout_s / 2
+        now = time.monotonic()
+        for client in self.registry.all():
+            age = now - client.last_seen
+            if age >= timeout_s and client.current_status != ClientStatus.DISCONNECTED:
+                self.registry.update_status(client.client_id, ClientStatus.DISCONNECTED)
+                self._record(
+                    "disconnect",
+                    client.client_id,
+                    None,
+                    payload={"status": ClientStatus.DISCONNECTED, "last_seen_age_s": age},
+                )
+                continue
+            if (
+                age >= degraded_s
+                and client.current_status
+                in {
+                    ClientStatus.CONNECTED,
+                    ClientStatus.REGISTERED,
+                    ClientStatus.SYNCED,
+                    ClientStatus.READY,
+                    ClientStatus.RUNNING,
+                }
+            ):
+                self.registry.update_status(client.client_id, ClientStatus.DEGRADED)
+                self._record(
+                    "degraded",
+                    client.client_id,
+                    None,
+                    payload={"status": ClientStatus.DEGRADED, "last_seen_age_s": age},
+                )
 
     def _message(
         self,
