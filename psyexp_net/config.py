@@ -39,6 +39,7 @@ def _coerce_env_value(raw: str) -> Any:
 
 @dataclass(slots=True)
 class NetworkConfig:
+    backend: str = "inmemory"
     host: str = "0.0.0.0"
     bind_host: str = "0.0.0.0"
     control_port: int = 5555

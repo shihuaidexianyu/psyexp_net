@@ -6,7 +6,7 @@
 
 * 完整的包结构与核心 API
 * 可运行的内存传输后端，适合本地开发与测试
-* `pyzmq`/`zeroconf` 的扩展接口与可选依赖入口
+* `pyzmq`/`zeroconf` 的可选局域网传输与发现后端
 * 命令行工具、示例程序与 `unittest` 测试
 
 ## 安装
@@ -27,6 +27,12 @@ python3 -m pip install -e .[zmq,discovery]
 
 ```bash
 python3 examples/demo_inmemory.py
+```
+
+运行 CLI demo，可切换到本地 ZMQ 后端：
+
+```bash
+python3 -m psyexp_net demo --backend zmq
 ```
 
 运行网络自检：
@@ -54,14 +60,13 @@ python3 -m psyexp_net replay .psyexp_net/sessions/<session-dir>
 * 统一消息头、JSON 编解码与字节负载封装
 * ACK 跟踪、去重、状态机与 barrier 管理
 * 服务器/客户端运行时 API
+* `inmemory` / `zmq` 两种 demo 传输路径
 * 应用层 ping/pong 时间同步与计划执行
 * JSONL 结构化事件记录与基础回放
 * `doctor` / `benchmark` / `inspect-log` CLI
 
 已预留扩展点：
 
-* `ZmqLanTransport`
-* `ZeroconfDiscoveryService`
 * LSL bridge
 * 更严格的认证模式
 

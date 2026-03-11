@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 from psyexp_net.config import AppConfig
+from psyexp_net.discovery.manual import ManualDiscoveryService
+from psyexp_net.discovery.zeroconf_service import ZeroconfDiscoveryService
 from psyexp_net.health.benchmark import run_inmemory_benchmark
 from psyexp_net.health.doctor import NetworkDoctor
 from psyexp_net.logging.replay import ReplayEngine
@@ -16,6 +19,7 @@ from psyexp_net.transport.memory import (
     InMemoryHub,
     InMemoryServerTransport,
 )
+from psyexp_net.transport.zmq_lan import ZmqLanTransport
 
 """命令行入口。
 
@@ -34,7 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--clients", type=int, default=4)
     benchmark.add_argument("--seconds", type=float, default=2.0)
 
-    subparsers.add_parser("demo")
+    demo = subparsers.add_parser("demo")
+    demo.add_argument(
+        "--backend",
+        choices=("inmemory", "zmq"),
+        default=None,
+        help="Run demo with the selected transport backend.",
+    )
 
     replay = subparsers.add_parser("replay")
     replay.add_argument("session_dir", type=Path)
@@ -53,6 +63,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     config = load_config(args.config)
+    config = apply_backend_override(config, getattr(args, "backend", None))
 
     if args.command == "doctor":
         report = asyncio.run(NetworkDoctor(config).run())
@@ -88,6 +99,87 @@ def main() -> None:
     parser.error(f"Unknown command {args.command}")
 
 
+def apply_backend_override(config: AppConfig, backend: str | None) -> AppConfig:
+    if backend is None:
+        return config
+    merged = config.to_dict()
+    merged.setdefault("network", {})["backend"] = backend
+    return AppConfig.from_mapping(merged)
+
+
+def _config_with_network_overrides(
+    config: AppConfig, **network_overrides: object
+) -> AppConfig:
+    merged = config.to_dict()
+    network = dict(merged["network"])
+    network.update(network_overrides)
+    merged["network"] = network
+    return AppConfig.from_mapping(merged)
+
+
+def _resolve_local_demo_config(config: AppConfig) -> AppConfig:
+    if config.network.backend != "zmq":
+        return config
+    bind_host = config.network.bind_host
+    host = config.network.host
+    overrides: dict[str, object] = {}
+    if bind_host in {"0.0.0.0", "::"}:
+        overrides["bind_host"] = "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        overrides["host"] = "127.0.0.1"
+    if overrides:
+        config = _config_with_network_overrides(config, **overrides)
+    if config.network.discovery == "zeroconf":
+        discovery = ZeroconfDiscoveryService(
+            config, service_name="psyexp-demo", server_id="demo"
+        )
+        try:
+            discovery.register()
+            records = discovery.discover(timeout=0)
+        finally:
+            discovery.close()
+        if records and records[0]["host"]:
+            return _config_with_network_overrides(config, host=records[0]["host"])
+        return config
+    host, _port = ManualDiscoveryService(config).server_endpoint()
+    if host in {"0.0.0.0", "::"}:
+        return _config_with_network_overrides(config, host="127.0.0.1")
+    return config
+
+
+def _build_demo_stack(
+    config: AppConfig,
+) -> tuple[ExperimentServer, ExperimentClient, ExperimentClient]:
+    if config.network.backend == "inmemory":
+        hub = InMemoryHub()
+        server = ExperimentServer(config, InMemoryServerTransport(hub))
+        stimulus_transport = InMemoryClientTransport(hub, "stim-01")
+        response_transport = InMemoryClientTransport(hub, "resp-01")
+    elif config.network.backend == "zmq":
+        server = ExperimentServer(config, ZmqLanTransport(config, is_server=True))
+        stimulus_transport = ZmqLanTransport(
+            config, is_server=False, client_id="stim-01"
+        )
+        response_transport = ZmqLanTransport(
+            config, is_server=False, client_id="resp-01"
+        )
+    else:
+        raise ValueError(f"Unsupported backend: {config.network.backend}")
+    stimulus = ExperimentClient(
+        config,
+        role="stimulus",
+        client_id="stim-01",
+        transport=stimulus_transport,
+    )
+    response = ExperimentClient(
+        config,
+        role="response",
+        client_id="resp-01",
+        transport=response_transport,
+    )
+    return server, stimulus, response
+
+
 async def run_demo(config: AppConfig) -> dict[str, object]:
     # demo 固定使用 stimulus/response 两个角色，演示最小实验流。
     config = AppConfig.from_mapping(
@@ -96,20 +188,8 @@ async def run_demo(config: AppConfig) -> dict[str, object]:
             "experiment": {"required_roles": ["stimulus", "response"]},
         }
     )
-    hub = InMemoryHub()
-    server = ExperimentServer(config, InMemoryServerTransport(hub))
-    stimulus = ExperimentClient(
-        config,
-        role="stimulus",
-        client_id="stim-01",
-        transport=InMemoryClientTransport(hub, "stim-01"),
-    )
-    response = ExperimentClient(
-        config,
-        role="response",
-        client_id="resp-01",
-        transport=InMemoryClientTransport(hub, "resp-01"),
-    )
+    config = _resolve_local_demo_config(config)
+    server, stimulus, response = _build_demo_stack(config)
 
     @response.on("TRIAL_START_AT")
     async def on_trial_start(message) -> None:
@@ -133,4 +213,10 @@ async def run_demo(config: AppConfig) -> dict[str, object]:
         await client.close()
     session_dir = str(server.recorder.session_dir)
     await server.shutdown()
-    return {"execute_at": execute_at, "result": result, "log_dir": session_dir}
+    return {
+        "backend": config.network.backend,
+        "network": asdict(config.network),
+        "execute_at": execute_at,
+        "result": result,
+        "log_dir": session_dir,
+    }
