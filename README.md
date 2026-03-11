@@ -35,6 +35,18 @@ python3 examples/demo_inmemory.py
 python3 -m psyexp_net demo --backend zmq
 ```
 
+启动一个 ZMQ 服务端：
+
+```bash
+python3 -m psyexp_net --config config.toml server start --backend zmq --publish-discovery
+```
+
+连接一个 ZMQ 客户端：
+
+```bash
+python3 -m psyexp_net --config config.toml client connect --backend zmq --role response --client-id resp-01 --report-on-trial-start
+```
+
 运行网络自检：
 
 ```bash
@@ -45,6 +57,12 @@ python3 -m psyexp_net doctor
 
 ```bash
 python3 -m psyexp_net benchmark --clients 4 --seconds 2
+```
+
+运行本地 ZMQ 基准测试：
+
+```bash
+python3 -m psyexp_net benchmark --backend zmq --clients 4 --seconds 2
 ```
 
 查看日志摘要：
@@ -64,6 +82,8 @@ python3 -m psyexp_net replay .psyexp_net/sessions/<session-dir>
 * 应用层 ping/pong 时间同步与计划执行
 * JSONL 结构化事件记录与基础回放
 * `doctor` / `benchmark` / `inspect-log` CLI
+* `inmemory` / `zmq` 两种 benchmark 路径
+* `server start` / `client connect` ZMQ 运行入口
 
 已预留扩展点：
 

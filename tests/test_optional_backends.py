@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import socket
 import sys
 import tempfile
@@ -11,7 +12,10 @@ from unittest.mock import patch
 
 from psyexp_net.cli.main import run_demo
 from psyexp_net.config import AppConfig
+from psyexp_net.health.benchmark import run_benchmark
 from psyexp_net.protocol.message import Message, MessageHeader
+
+_ORIGINAL_FIND_SPEC = importlib.util.find_spec
 
 
 class _FakeBroker:
@@ -185,18 +189,19 @@ class _FakeServiceInfo:
 
 
 class _FakeZeroconf:
+    registry: dict[str, _FakeServiceInfo] = {}
+
     def __init__(self) -> None:
-        self.registry: dict[str, _FakeServiceInfo] = {}
         self.closed = False
 
     def register_service(self, info: _FakeServiceInfo) -> None:
-        self.registry[info.name] = info
+        type(self).registry[info.name] = info
 
     def unregister_service(self, info: _FakeServiceInfo) -> None:
-        self.registry.pop(info.name, None)
+        type(self).registry.pop(info.name, None)
 
     def get_service_info(self, service_type: str, name: str):
-        info = self.registry.get(name)
+        info = type(self).registry.get(name)
         if info is None or info.type_ != service_type:
             return None
         return info
@@ -208,7 +213,7 @@ class _FakeZeroconf:
 class _FakeServiceBrowser:
     def __init__(self, zeroconf: _FakeZeroconf, service_type: str, listener) -> None:
         self.cancelled = False
-        for name, info in zeroconf.registry.items():
+        for name, info in type(zeroconf).registry.items():
             if info.type_ == service_type:
                 listener.add_service(zeroconf, service_type, name)
 
@@ -231,6 +236,15 @@ class OptionalBackendsTests(unittest.IsolatedAsyncioTestCase):
         zeroconf_module.ServiceInfo = _FakeServiceInfo
         zeroconf_module.ServiceBrowser = _FakeServiceBrowser
         return {"zeroconf": zeroconf_module}
+
+    def _load_doctor_module(self):
+        module = importlib.import_module("psyexp_net.health.doctor")
+        return importlib.reload(module)
+
+    def _find_spec_side_effect(self, name: str):
+        if name in {"zmq", "zeroconf"}:
+            return object()
+        return _ORIGINAL_FIND_SPEC(name)
 
     async def test_zmq_transport_roundtrip_and_broadcast(self) -> None:
         modules, _broker = self._load_zmq_transport()
@@ -317,6 +331,7 @@ class OptionalBackendsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result"]["response"], "space")
 
     async def test_zeroconf_service_register_and_discover(self) -> None:
+        _FakeZeroconf.registry.clear()
         with patch.dict(sys.modules, self._load_zeroconf_service()):
             module = importlib.import_module("psyexp_net.discovery.zeroconf_service")
             module = importlib.reload(module)
@@ -367,6 +382,201 @@ class OptionalBackendsTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result["backend"], "inmemory")
         self.assertEqual(result["result"]["response"], "space")
+
+    async def test_run_server_and_client_commands_over_zmq(self) -> None:
+        modules, _broker = self._load_zmq_transport()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(sys.modules, modules):
+                cli_module = importlib.import_module("psyexp_net.cli.main")
+                cli_module = importlib.reload(cli_module)
+                config = AppConfig.from_mapping(
+                    {
+                        "logging": {"base_dir": tmpdir},
+                        "network": {
+                            "backend": "zmq",
+                            "host": "0.0.0.0",
+                            "bind_host": "0.0.0.0",
+                            "control_port": 6531,
+                            "pub_port": 6532,
+                        },
+                        "experiment": {
+                            "required_roles": ["stimulus", "response"],
+                        },
+                    }
+                )
+                server_task = asyncio.create_task(
+                    cli_module.run_server_command(
+                        config,
+                        duration=0.0,
+                        publish_discovery=False,
+                        wait_for_ready=True,
+                        start_session=True,
+                        session_id="S-CMD",
+                        trial_id="T-CMD",
+                        result_role="response",
+                    )
+                )
+                await asyncio.sleep(0)
+                stimulus_task = asyncio.create_task(
+                    cli_module.run_client_command(
+                        config,
+                        role="stimulus",
+                        client_id="stim-cmd",
+                        duration=0.2,
+                        report_on_trial_start=False,
+                    )
+                )
+                response_task = asyncio.create_task(
+                    cli_module.run_client_command(
+                        config,
+                        role="response",
+                        client_id="resp-cmd",
+                        duration=0.2,
+                        report_on_trial_start=True,
+                    )
+                )
+                server_result, stimulus_result, response_result = await asyncio.gather(
+                    server_task, stimulus_task, response_task
+                )
+        self.assertEqual(server_result["session_id"], "S-CMD")
+        self.assertEqual(server_result["trial_id"], "T-CMD")
+        self.assertEqual(server_result["collected_result"]["response"], "space")
+        self.assertEqual(server_result["collected_result"]["client_id"], "resp-cmd")
+        self.assertEqual(stimulus_result["register_response"], "REGISTER_OK")
+        self.assertEqual(response_result["register_response"], "REGISTER_OK")
+        self.assertIn("TRIAL_START_AT", response_result["seen_messages"])
+
+    async def test_run_benchmark_inmemory_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = await run_benchmark(
+                AppConfig.from_mapping(
+                    {
+                        "logging": {"base_dir": tmpdir},
+                        "network": {"backend": "inmemory"},
+                    }
+                ),
+                clients=2,
+                seconds=0.05,
+            )
+        self.assertEqual(result["backend"], "inmemory")
+        self.assertGreaterEqual(result["iterations"], 1.0)
+        self.assertGreaterEqual(result["data_reports"], 2.0)
+        self.assertIn("avg_broadcast_ms", result)
+
+    async def test_run_benchmark_zmq_backend(self) -> None:
+        modules, _broker = self._load_zmq_transport()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(sys.modules, modules):
+                benchmark_module = importlib.import_module("psyexp_net.health.benchmark")
+                benchmark_module = importlib.reload(benchmark_module)
+                result = await benchmark_module.run_benchmark(
+                    AppConfig.from_mapping(
+                        {
+                            "logging": {"base_dir": tmpdir},
+                            "network": {
+                                "backend": "zmq",
+                                "host": "0.0.0.0",
+                                "bind_host": "0.0.0.0",
+                                "control_port": 6521,
+                                "pub_port": 6522,
+                            },
+                        }
+                    ),
+                    clients=2,
+                    seconds=0.05,
+                )
+        self.assertEqual(result["backend"], "zmq")
+        self.assertGreaterEqual(result["iterations"], 1.0)
+        self.assertGreaterEqual(result["data_reports"], 2.0)
+        self.assertIn("avg_broadcast_ms", result)
+
+    async def test_doctor_manual_reachable_port(self) -> None:
+        doctor_module = self._load_doctor_module()
+        class _Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("socket.create_connection", return_value=_Conn()):
+            report = await doctor_module.NetworkDoctor(
+                AppConfig.from_mapping(
+                    {
+                        "network": {
+                            "backend": "inmemory",
+                            "host": "127.0.0.1",
+                            "control_port": 7555,
+                            "discovery": "manual",
+                        }
+                    }
+                )
+            ).run()
+        self.assertTrue(report.reachable)
+        self.assertIsNone(report.handshake_ok)
+        self.assertEqual(report.target, "127.0.0.1")
+
+    async def test_doctor_zmq_zeroconf_handshake(self) -> None:
+        _FakeZeroconf.registry.clear()
+        modules, _broker = self._load_zmq_transport()
+        zeroconf_modules = self._load_zeroconf_service()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(sys.modules, {**modules, **zeroconf_modules}):
+                zmq_module = importlib.import_module("psyexp_net.transport.zmq_lan")
+                zmq_module = importlib.reload(zmq_module)
+                discovery_module = importlib.import_module(
+                    "psyexp_net.discovery.zeroconf_service"
+                )
+                discovery_module = importlib.reload(discovery_module)
+                doctor_module = self._load_doctor_module()
+                config = AppConfig.from_mapping(
+                    {
+                        "logging": {"base_dir": tmpdir},
+                        "network": {
+                            "backend": "zmq",
+                            "host": "127.0.0.1",
+                            "bind_host": "127.0.0.1",
+                            "control_port": 7401,
+                            "pub_port": 7402,
+                            "discovery": "zeroconf",
+                        },
+                    }
+                )
+                from psyexp_net.runtime.server import ExperimentServer
+
+                server = ExperimentServer(
+                    config, zmq_module.ZmqLanTransport(config, is_server=True)
+                )
+                discovery = discovery_module.ZeroconfDiscoveryService(
+                    config, service_name="doctor-server", server_id="srv-doctor"
+                )
+                await server.start()
+                discovery.register()
+
+                class _Conn:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                try:
+                    with patch(
+                        "importlib.util.find_spec",
+                        side_effect=self._find_spec_side_effect,
+                    ):
+                        with patch("socket.create_connection", return_value=_Conn()):
+                            report = await doctor_module.NetworkDoctor(config).run()
+                finally:
+                    discovery.close()
+                    await server.shutdown()
+
+        self.assertTrue(report.service_visible)
+        self.assertTrue(report.reachable)
+        self.assertTrue(report.handshake_ok)
+        self.assertTrue(report.protocol_match)
+        self.assertIsNotNone(report.avg_rtt_ms)
+        self.assertIsNotNone(report.jitter_ms)
 
 
 if __name__ == "__main__":
